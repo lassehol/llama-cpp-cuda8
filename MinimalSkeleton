@@ -1,0 +1,279 @@
+Setting up CUDA C++
+I'm pulling together a CUDA C++ code skeleton for the GTX560, covering headers, streams, events, and cuBLAS calls, with a prototype pipeline for benchmarking. Awesome—here’s a minimal, self‑contained CUDA/C++ skeleton you can use to prototype the GTX 560 (Fermi, CC 2.1) pipeline. It shows:
+
+headers & error‑checking
+stream & event setup
+cuBLAS GEMM call (FP32)
+a reference qmm_kernel signature (quantized matmul stub)
+simple bias add kernel
+pinned host memory & async H2D/D2H transfers
+a triple‑buffered stream pipeline
+
+
+Assumptions (Fermi/CUDA‑8 era mindset):
+• FP32 math via cuBLAS cublasSgemm (no Tensor Cores/WMMA; DP4A not available on Fermi).
+• Column‑major layout for cuBLAS. Shapes: X (M×K), W (K×N), Y (M×N).
+• Keep W resident on device; stream X and Y via pinned memory + async copies.
+• Triple buffering with 4 streams: H2D, GEMM, Bias, D2H.
+
+
+
+
+main.cu (minimal skeleton)
+// nvcc -arch=sm_21 -std=c++11 -lcublas main.cu -o prototype
+// Tested syntax against CUDA 8.0-era expectations (keep C++11; avoid newer dialects).
+
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <cassert>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+// ---------------------------------------------
+// Error checking helpers
+// ---------------------------------------------
+#define CHECK_CUDA(call) do { \n  cudaError_t _e = (call); \n  if (_e != cudaSuccess) { \n    fprintf(stderr, "CUDA error %s:%d: %s
+", __FILE__, __LINE__, cudaGetErrorString(_e)); \n    std::exit(EXIT_FAILURE); \n  } \n} while(0)
+
+#define CHECK_CUBLAS(call) do { \n  cublasStatus_t _s = (call); \n  if (_s != CUBLAS_STATUS_SUCCESS) { \n    fprintf(stderr, "cuBLAS error %s:%d: status=%d
+", __FILE__, __LINE__, int(_s)); \n    std::exit(EXIT_FAILURE); \n  } \n} while(0)
+
+// ---------------------------------------------
+// Minimal bias-add kernel (Y += b row-wise)
+// Y is MxN column-major; b is length N
+// ---------------------------------------------
+__global__ void add_bias_kernel(float* __restrict__ Y,
+                                const float* __restrict__ b,
+                                int M, int N) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= N) return;
+  // column-major: each column is contiguous in memory stepping by M
+  for (int row = 0; row < M; ++row) {
+    Y[col * M + row] += b[col];
+  }
+}
+
+// ---------------------------------------------
+// Reference quantized matmul kernel signature (stub)
+// No DP4A on Fermi; perform manual dequant + FP32 accumulate.
+// Wq: packed int8 or 4-bit (layout TBD), scales: per-block scales.
+// Tile sizes & packing are left to implement.
+// ---------------------------------------------
+__global__ void qmm_kernel(const float* __restrict__ X,      // MxK, fp32
+                           const unsigned char* __restrict__ Wq, // quantized weights (packed)
+                           const float* __restrict__ scales, // per-block scales for Wq
+                           float* __restrict__ Y,            // MxN, fp32
+                           int M, int N, int K,
+                           int blockSize,    // elements per quantization block (e.g., 32/64)
+                           int bitsPerWeight // 4 or 8
+                           )
+{
+  // TODO: implement shared-memory tiling:
+  // 1) load tile of X to shared memory
+  // 2) load tile of Wq + scales
+  // 3) dequantize into registers: w_fp32 = scale * dequant(wq_packed)
+  // 4) accumulate y += x * w_fp32 (FP32)
+  // 5) write Y tile back to global memory
+  // This stub is provided for compilation; does nothing now.
+}
+
+// ---------------------------------------------
+// Utility: initialize host data
+// ---------------------------------------------
+static void init_random(std::vector<float>& v, float scale = 0.01f) {
+  for (size_t i = 0; i < v.size(); ++i) {
+    v[i] = scale * float(std::rand()) / float(RAND_MAX);
+  }
+}
+
+// ---------------------------------------------
+// Main: triple-buffer pipeline
+// ---------------------------------------------
+int main(int argc, char** argv) {
+  // Problem sizes (adjust to taste)
+  const int M = 1024;      // rows of X, Y
+  const int K = 2048;      // cols of X, rows of W
+  const int N = 1024;      // cols of W, Y
+  const int NUM_BUFFERS = 3;
+
+  // Select device 0
+  CHECK_CUDA(cudaSetDevice(0));
+
+  // Create streams
+  cudaStream_t streamH2D, streamGEMM, streamBias, streamD2H;
+  CHECK_CUDA(cudaStreamCreate(&streamH2D));
+  CHECK_CUDA(cudaStreamCreate(&streamGEMM));
+  CHECK_CUDA(cudaStreamCreate(&streamBias));
+  CHECK_CUDA(cudaStreamCreate(&streamD2H));
+
+  // cuBLAS setup
+  cublasHandle_t handle;
+  CHECK_CUBLAS(cublasCreate(&handle));
+  // Bind GEMM stream to cuBLAS
+  CHECK_CUBLAS(cublasSetStream(handle, streamGEMM));
+  // Column-major convention, FP32
+  const float alpha = 1.0f;
+  const float beta  = 1.0f;
+
+  // Host pinned buffers (triple-buffered X & Y)
+  size_t bytesX = size_t(M) * size_t(K) * sizeof(float);
+  size_t bytesY = size_t(M) * size_t(N) * sizeof(float);
+  float* hX[NUM_BUFFERS] = {nullptr};
+  float* hY[NUM_BUFFERS] = {nullptr};
+
+  for (int i = 0; i < NUM_BUFFERS; ++i) {
+    CHECK_CUDA(cudaHostAlloc((void**)&hX[i], bytesX, cudaHostAllocDefault));
+    CHECK_CUDA(cudaHostAlloc((void**)&hY[i], bytesY, cudaHostAllocDefault));
+  }
+
+  // Host bias (unpinned is fine; could pin for consistency)
+  std::vector<float> hb(N);
+  init_random(hb);
+
+  // Device buffers
+  float *dX[NUM_BUFFERS] = {nullptr}, *dY[NUM_BUFFERS] = {nullptr};
+  for (int i = 0; i < NUM_BUFFERS; ++i) {
+    CHECK_CUDA(cudaMalloc((void**)&dX[i], bytesX));
+    CHECK_CUDA(cudaMalloc((void**)&dY[i], bytesY));
+  }
+
+  // Device weights W (keep resident)
+  size_t bytesW = size_t(K) * size_t(N) * sizeof(float);
+  float* dW = nullptr;
+  CHECK_CUDA(cudaMalloc((void**)&dW, bytesW));
+
+  // Initialize & upload W
+  std::vector<float> hW(K * N);
+  init_random(hW);
+  CHECK_CUDA(cudaMemcpyAsync(dW, hW.data(), bytesW, cudaMemcpyHostToDevice, streamH2D));
+
+  // Device bias
+  float* db = nullptr;
+  CHECK_CUDA(cudaMalloc((void**)&db, N * sizeof(float)));
+  CHECK_CUDA(cudaMemcpyAsync(db, hb.data(), N * sizeof(float), cudaMemcpyHostToDevice, streamH2D));
+
+  // Events per buffer to chain stages
+  cudaEvent_t evXReady[NUM_BUFFERS], evGemmDone[NUM_BUFFERS], evBiasDone[NUM_BUFFERS], evYReady[NUM_BUFFERS];
+  for (int i = 0; i < NUM_BUFFERS; ++i) {
+    CHECK_CUDA(cudaEventCreateWithFlags(&evXReady[i],  cudaEventDisableTiming));
+    CHECK_CUDA(cudaEventCreateWithFlags(&evGemmDone[i], cudaEventDisableTiming));
+    CHECK_CUDA(cudaEventCreateWithFlags(&evBiasDone[i], cudaEventDisableTiming));
+    CHECK_CUDA(cudaEventCreateWithFlags(&evYReady[i],  cudaEventDisableTiming));
+  }
+
+  // Warm up host X buffers
+  for (int i = 0; i < NUM_BUFFERS; ++i) {
+    std::vector<float> tmpX(M * K);
+    init_random(tmpX);
+    std::memcpy(hX[i], tmpX.data(), bytesX);
+  }
+
+  // Pipeline iterations (e.g., tokens or micro-batches)
+  const int iters = 10; // keep small for a skeleton
+  for (int it = 0; it < iters; ++it) {
+    const int buf = it % NUM_BUFFERS;
+
+    // Stage 1: H2D for X -> dX[buf]
+    CHECK_CUDA(cudaMemcpyAsync(dX[buf], hX[buf], bytesX, cudaMemcpyHostToDevice, streamH2D));
+    CHECK_CUDA(cudaEventRecord(evXReady[buf], streamH2D));
+
+    // Stage 2: GEMM Y = X·W + (beta * Y)
+    // Wait for X readiness in GEMM stream
+    CHECK_CUDA(cudaStreamWaitEvent(streamGEMM, evXReady[buf], 0));
+
+    // (Optional) clear Y first if you want beta=0.0f behavior:
+    // CHECK_CUDA(cudaMemsetAsync(dY[buf], 0, bytesY, streamGEMM));
+    // For demonstration we use beta=1 and assume Y initially zeros or previous content
+    // cuBLAS is column-major: ldX=M, ldW=K, ldY=M
+    CHECK_CUBLAS(
+      cublasSgemm(handle,
+                  CUBLAS_OP_N, CUBLAS_OP_N,
+                  /* m */ N, /* n */ M, /* k */ K, // note: cuBLAS arguments are transposed vs. row-major intuition
+                  &alpha,
+                  dW, /* ldW */ K,
+                  dX[buf], /* ldX */ M,
+                  &beta,
+                  dY[buf], /* ldY */ M)
+    );
+    CHECK_CUDA(cudaEventRecord(evGemmDone[buf], streamGEMM));
+
+    // Stage 3: add bias on streamBias (wait GEMM)
+    CHECK_CUDA(cudaStreamWaitEvent(streamBias, evGemmDone[buf], 0));
+    int threads = 256;
+    int blocks  = (N + threads - 1) / threads;
+    add_bias_kernel<<<blocks, threads, 0, streamBias>>>(dY[buf], db, M, N);
+    CHECK_CUDA(cudaEventRecord(evBiasDone[buf], streamBias));
+
+    // Stage 4: D2H for Y
+    CHECK_CUDA(cudaStreamWaitEvent(streamD2H, evBiasDone[buf], 0));
+    CHECK_CUDA(cudaMemcpyAsync(hY[buf], dY[buf], bytesY, cudaMemcpyDeviceToHost, streamD2H));
+    CHECK_CUDA(cudaEventRecord(evYReady[buf], streamD2H));
+
+    // CPU can consume hY[buf] after evYReady[buf] completes
+    CHECK_CUDA(cudaEventSynchronize(evYReady[buf]));
+    // e.g., sampling or next-step prep (placeholder):
+    float checksum = 0.0f;
+    for (size_t i = 0; i < size_t(M)*size_t(N); i += (M*N/16)) checksum += hY[buf][i];
+    printf("[iter %d] Y checksum (sampled): %f
+", it, checksum);
+
+    // Prepare next hX[buf] on CPU (simulate token/state change)
+    std::vector<float> tmpX(M * K);
+    init_random(tmpX);
+    std::memcpy(hX[buf], tmpX.data(), bytesX);
+  }
+
+  // Graceful teardown
+  CHECK_CUBLAS(cublasDestroy(handle));
+  CHECK_CUDA(cudaStreamDestroy(streamH2D));
+  CHECK_CUDA(cudaStreamDestroy(streamGEMM));
+  CHECK_CUDA(cudaStreamDestroy(streamBias));
+  CHECK_CUDA(cudaStreamDestroy(streamD2H));
+
+  for (int i = 0; i < NUM_BUFFERS; ++i) {
+    CHECK_CUDA(cudaEventDestroy(evXReady[i]));
+    CHECK_CUDA(cudaEventDestroy(evGemmDone[i]));
+    CHECK_CUDA(cudaEventDestroy(evBiasDone[i]));
+    CHECK_CUDA(cudaEventDestroy(evYReady[i]));
+  }
+
+  CHECK_CUDA(cudaFree(dW));
+  CHECK_CUDA(cudaFree(db));
+  for (int i = 0; i < NUM_BUFFERS; ++i) {
+    CHECK_CUDA(cudaFree(dX[i]));
+    CHECK_CUDA(cudaFree(dY[i]));
+    CHECK_CUDA(cudaFreeHost(hX[i]));
+    CHECK_CUDA(cudaFreeHost(hY[i]));
+  }
+
+  printf("Done.
+");
+  return 0;
+}
+
+
+
+
+How to build (GTX 560, Fermi)
+# Linux / WSL (example), CUDA toolkit & cuBLAS installed
+nvcc -arch=sm_21 -std=c++11 -lcublas main.cu -o prototype
+./prototype
+
+
+
+-arch=sm_21 targets Fermi (GTX 560 CC 2.1).
+Keep the C++ standard modest (e.g., -std=c++11) for toolchain compatibility in a CUDA‑8‑era mindset.
+If you’re on Windows + VS, use a CUDA‑supported MSVC version and set the code generation to sm_21.
+
+
+Notes & next steps
+
+cuBLAS layout: Above we used column‑major (native to cuBLAS). Shapes are X(M×K), W(K×N), Y(M×N) with leading dimensions ldX=M, ldW=K, ldY=M. If you prefer row‑major, you can swap operands & use transposes (`CUBLAS_OP_T`)—but starting column‑major is simpler.
+Quantized path: The qmm_kernel is a stub. To try quantization:
+1) Quantize W on CPU (e.g., int8 or packed 4‑bit) with per‑block scales.
+2) Upload Wq + scales to device once.
+3) Replace cublasSgemm with qmm_kernel<<<grid, block, shared, streamGEMM>>> using shared memory tiling.
+
+Overlap: The triple‑buffered pattern plus separate streams lets you overlap H2D, GEMM, bias, and D2H. You can add cudaEvent_t timing around stages to benchmark.
+Batching: If you can process multiple tokens or sequences at once, form a batched GEMM to amortize launch overhead and PCIe transfers.
