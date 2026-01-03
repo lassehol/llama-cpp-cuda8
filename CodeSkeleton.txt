@@ -1,0 +1,147 @@
+Here’s a starter code skeleton for ggml-cuda8 that sets up the structure for the CUDA 8 backend, including headers, kernel stubs, and CMake integration:
+
+
+Directory Structure
+llama-cpp/
+ ├── ggml-cuda8/
+ │    ├── CMakeLists.txt
+ │    ├── cuda8_context.h
+ │    ├── cuda8_context.cpp
+ │    ├── cuda8_kernels.cu
+ │    ├── cuda8_kernels.h
+ │    └── cuda8_backend.cpp
+
+
+
+
+CMakeLists.txt
+cmake_minimum_required(VERSION 3.5)
+project(ggml-cuda8 LANGUAGES C CXX CUDA)
+
+# CUDA 8 compatibility
+set(CMAKE_CUDA_STANDARD 11)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# Target for CUDA8 backend
+add_library(ggml-cuda8 STATIC
+    cuda8_context.cpp
+    cuda8_kernels.cu
+    cuda8_backend.cpp
+)
+
+target_include_directories(ggml-cuda8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ggml-cuda8 PUBLIC cublas cuda)
+set_target_properties(ggml-cuda8 PROPERTIES CUDA_ARCHITECTURES "21")
+
+
+
+
+cuda8_context.h
+#ifndef CUDA8_CONTEXT_H
+#define CUDA8_CONTEXT_H
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+struct cuda8_context {
+    cublasHandle_t handle;
+    int device_id;
+    size_t free_mem;
+    size_t total_mem;
+
+    cuda8_context();
+    ~cuda8_context();
+
+    void init();
+    void destroy();
+};
+
+#endif // CUDA8_CONTEXT_H
+
+
+
+
+cuda8_context.cpp
+#include "cuda8_context.h"
+#include <iostream>
+
+cuda8_context::cuda8_context() : handle(nullptr), device_id(0) {}
+
+void cuda8_context::init() {
+    cudaSetDevice(device_id);
+    cublasCreate(&handle);
+    cudaMemGetInfo(&free_mem, &total_mem);
+    std::cout << "[CUDA8] Initialized on device " << device_id
+              << " Free: " << free_mem << " Total: " << total_mem << std::endl;
+}
+
+void cuda8_context::destroy() {
+    if (handle) cublasDestroy(handle);
+}
+
+
+
+
+cuda8_kernels.h
+#ifndef CUDA8_KERNELS_H
+#define CUDA8_KERNELS_H
+
+#include <cuda_runtime.h>
+
+// Basic kernels
+__global__ void vec_add_kernel(const float* a, const float* b, float* c, int n);
+__global__ void vec_mul_kernel(const float* a, const float* b, float* c, int n);
+
+// Softmax kernel (simplified)
+__global__ void softmax_kernel(float* data, int n);
+
+#endif // CUDA8_KERNELS_H
+
+
+
+
+cuda8_kernels.cu
+#include "cuda8_kernels.h"
+
+__global__ void vec_add_kernel(const float* a, const float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) c[idx] = a[idx] + b[idx];
+}
+
+__global__ void vec_mul_kernel(const float* a, const float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) c[idx] = a[idx] * b[idx];
+}
+
+__global__ void softmax_kernel(float* data, int n) {
+    // Placeholder: implement shared memory reduction for older GPUs
+}
+
+
+
+
+cuda8_backend.cpp
+#include "cuda8_context.h"
+#include "cuda8_kernels.h"
+#include <cublas_v2.h>
+
+void ggml_cuda8_gemm(cuda8_context& ctx, const float* A, const float* B, float* C,
+                     int M, int N, int K) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasSgemm(ctx.handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                M, N, K,
+                &alpha, A, M, B, K, &beta, C, M);
+}
+
+
+
+
+Next Steps
+
+Implement softmax and attention kernels using shared memory reductions.
+Add CPU-GPU tensor transfer utilities.
+Integrate with ggml-backend.c by adding GGML_BACKEND_CUDA8.
+
+
+✅ Do you want me to extend this skeleton with a full integration example into ggml (including backend registration and CPU fallback), or prepare a minimal working prototype that runs a GEMM operation on GTX 560 using this skeleton?
