@@ -1,6 +1,7 @@
 include(CheckCXXCompilerFlag)
 include("../cmake/common.cmake")
 
+option(GGML_CUDA8 "Enable CUDA8 backend" OFF)
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 
 # enable libstdc++ assertions for debug builds
@@ -447,6 +448,7 @@ endif()
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
+ggml_add_backend(CUDA8)
 ggml_add_backend(HIP)
 ggml_add_backend(METAL)
 ggml_add_backend(MUSA)
